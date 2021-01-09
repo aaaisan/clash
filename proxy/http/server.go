@@ -16,10 +16,6 @@ import (
 	"github.com/Dreamacro/clash/tunnel"
 )
 
-var (
-	tun = tunnel.Instance()
-)
-
 type HttpListener struct {
 	net.Listener
 	address string
@@ -45,7 +41,7 @@ func NewHttpProxy(addr string) (*HttpListener, error) {
 				}
 				continue
 			}
-			go handleConn(c, hl.cache)
+			go HandleConn(c, hl.cache)
 		}
 	}()
 
@@ -64,6 +60,7 @@ func (l *HttpListener) Address() string {
 func canActivate(loginStr string, authenticator auth.Authenticator, cache *cache.Cache) (ret bool) {
 	if result := cache.Get(loginStr); result != nil {
 		ret = result.(bool)
+		return
 	}
 	loginData, err := base64.StdEncoding.DecodeString(loginStr)
 	login := strings.Split(string(loginData), ":")
@@ -73,23 +70,31 @@ func canActivate(loginStr string, authenticator auth.Authenticator, cache *cache
 	return
 }
 
-func handleConn(conn net.Conn, cache *cache.Cache) {
+func HandleConn(conn net.Conn, cache *cache.Cache) {
 	br := bufio.NewReader(conn)
+
+keepAlive:
 	request, err := http.ReadRequest(br)
 	if err != nil || request.URL.Host == "" {
 		conn.Close()
 		return
 	}
 
+	keepAlive := strings.TrimSpace(strings.ToLower(request.Header.Get("Proxy-Connection"))) == "keep-alive"
 	authenticator := authStore.Authenticator()
 	if authenticator != nil {
 		if authStrings := strings.Split(request.Header.Get("Proxy-Authorization"), " "); len(authStrings) != 2 {
-			_, err = conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n"))
-			conn.Close()
+			conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n"))
+			if keepAlive {
+				goto keepAlive
+			}
 			return
 		} else if !canActivate(authStrings[1], authenticator, cache) {
 			conn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 			log.Infoln("Auth failed from %s", conn.RemoteAddr().String())
+			if keepAlive {
+				goto keepAlive
+			}
 			conn.Close()
 			return
 		}
@@ -98,11 +103,12 @@ func handleConn(conn net.Conn, cache *cache.Cache) {
 	if request.Method == http.MethodConnect {
 		_, err := conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
 		if err != nil {
+			conn.Close()
 			return
 		}
-		tun.Add(adapters.NewHTTPS(request, conn))
+		tunnel.Add(adapters.NewHTTPS(request, conn))
 		return
 	}
 
-	tun.Add(adapters.NewHTTP(request, conn))
+	tunnel.Add(adapters.NewHTTP(request, conn))
 }

@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -16,7 +17,6 @@ import (
 
 type Socks5 struct {
 	*Base
-	addr           string
 	user           string
 	pass           string
 	tls            bool
@@ -35,19 +35,16 @@ type Socks5Option struct {
 	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
 }
 
-func (ss *Socks5) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	c, err := dialContext(ctx, "tcp", ss.addr)
-
-	if err == nil && ss.tls {
+func (ss *Socks5) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error) {
+	if ss.tls {
 		cc := tls.Client(c, ss.tlsConfig)
-		err = cc.Handshake()
+		err := cc.Handshake()
 		c = cc
+		if err != nil {
+			return nil, fmt.Errorf("%s connect error: %w", ss.addr, err)
+		}
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("%s connect error: %w", ss.addr, err)
-	}
-	tcpKeepAlive(c)
 	var user *socks5.User
 	if ss.user != "" {
 		user = &socks5.User{
@@ -58,13 +55,28 @@ func (ss *Socks5) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn
 	if _, err := socks5.ClientHandshake(c, serializesSocksAddr(metadata), socks5.CmdConnect, user); err != nil {
 		return nil, err
 	}
-	return newConn(c, ss), nil
+	return c, nil
+}
+
+func (ss *Socks5) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+	c, err := dialer.DialContext(ctx, "tcp", ss.addr)
+	if err != nil {
+		return nil, fmt.Errorf("%s connect error: %w", ss.addr, err)
+	}
+	tcpKeepAlive(c)
+
+	c, err = ss.StreamConn(c, metadata)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewConn(c, ss), nil
 }
 
 func (ss *Socks5) DialUDP(metadata *C.Metadata) (_ C.PacketConn, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), tcpTimeout)
 	defer cancel()
-	c, err := dialContext(ctx, "tcp", ss.addr)
+	c, err := dialer.DialContext(ctx, "tcp", ss.addr)
 	if err != nil {
 		err = fmt.Errorf("%s connect error: %w", ss.addr, err)
 		return
@@ -110,7 +122,7 @@ func (ss *Socks5) DialUDP(metadata *C.Metadata) (_ C.PacketConn, err error) {
 		pc.Close()
 	}()
 
-	return newPacketConn(&socksUDPConn{PacketConn: pc, rAddr: bindAddr.UDPAddr(), tcpConn: c}, ss), nil
+	return newPacketConn(&socksPacketConn{PacketConn: pc, rAddr: bindAddr.UDPAddr(), tcpConn: c}, ss), nil
 }
 
 func NewSocks5(option Socks5Option) *Socks5 {
@@ -126,10 +138,10 @@ func NewSocks5(option Socks5Option) *Socks5 {
 	return &Socks5{
 		Base: &Base{
 			name: option.Name,
+			addr: net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
 			tp:   C.Socks5,
 			udp:  option.UDP,
 		},
-		addr:           net.JoinHostPort(option.Server, strconv.Itoa(option.Port)),
 		user:           option.UserName,
 		pass:           option.Password,
 		tls:            option.TLS,
@@ -138,13 +150,13 @@ func NewSocks5(option Socks5Option) *Socks5 {
 	}
 }
 
-type socksUDPConn struct {
+type socksPacketConn struct {
 	net.PacketConn
 	rAddr   net.Addr
 	tcpConn net.Conn
 }
 
-func (uc *socksUDPConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+func (uc *socksPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	packet, err := socks5.EncodeUDPPacket(socks5.ParseAddrToSocksAddr(addr), b)
 	if err != nil {
 		return
@@ -152,8 +164,8 @@ func (uc *socksUDPConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	return uc.PacketConn.WriteTo(packet, uc.rAddr)
 }
 
-func (uc *socksUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	n, a, e := uc.PacketConn.ReadFrom(b)
+func (uc *socksPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, _, e := uc.PacketConn.ReadFrom(b)
 	if e != nil {
 		return 0, nil, e
 	}
@@ -161,13 +173,18 @@ func (uc *socksUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+
+	udpAddr := addr.UDPAddr()
+	if udpAddr == nil {
+		return 0, nil, errors.New("parse udp addr error")
+	}
+
 	// due to DecodeUDPPacket is mutable, record addr length
-	addrLength := len(addr)
 	copy(b, payload)
-	return n - addrLength - 3, a, nil
+	return n - len(addr) - 3, udpAddr, nil
 }
 
-func (uc *socksUDPConn) Close() error {
+func (uc *socksPacketConn) Close() error {
 	uc.tcpConn.Close()
 	return uc.PacketConn.Close()
 }

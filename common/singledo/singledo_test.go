@@ -6,12 +6,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/atomic"
 )
 
 func TestBasic(t *testing.T) {
 	single := NewSingle(time.Millisecond * 30)
 	foo := 0
-	shardCount := 0
+	var shardCount = atomic.NewInt32(0)
 	call := func() (interface{}, error) {
 		foo++
 		time.Sleep(time.Millisecond * 5)
@@ -19,13 +20,13 @@ func TestBasic(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	const n = 10
+	const n = 5
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		go func() {
 			_, _, shard := single.Do(call)
 			if shard {
-				shardCount++
+				shardCount.Inc()
 			}
 			wg.Done()
 		}()
@@ -33,7 +34,7 @@ func TestBasic(t *testing.T) {
 
 	wg.Wait()
 	assert.Equal(t, 1, foo)
-	assert.Equal(t, 9, shardCount)
+	assert.Equal(t, int32(4), shardCount.Load())
 }
 
 func TestTimer(t *testing.T) {
@@ -50,4 +51,19 @@ func TestTimer(t *testing.T) {
 
 	assert.Equal(t, 1, foo)
 	assert.True(t, shard)
+}
+
+func TestReset(t *testing.T) {
+	single := NewSingle(time.Millisecond * 30)
+	foo := 0
+	call := func() (interface{}, error) {
+		foo++
+		return nil, nil
+	}
+
+	single.Do(call)
+	single.Reset()
+	single.Do(call)
+
+	assert.Equal(t, 2, foo)
 }
